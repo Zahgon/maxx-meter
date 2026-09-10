@@ -1,4 +1,4 @@
-import type { FastifyRequest } from "fastify";
+import type { Request } from "express";
 
 export interface HaUserContext {
   userId: string;
@@ -12,7 +12,7 @@ const SINGLE_USER: HaUserContext = {
   isAdmin: true,
 };
 
-export function resolveUserFromRequest(req: FastifyRequest): HaUserContext {
+export function resolveUserFromRequest(req: Request): HaUserContext {
   const userId = headerString(req, "x-remote-user-id");
   const userName = headerString(req, "x-remote-user-name") ?? userId ?? "User";
   const adminHeader = headerString(req, "x-remote-user-is-admin");
@@ -61,7 +61,7 @@ export function mergeDashboardUsers(
     .sort((a, b) => a.userName.localeCompare(b.userName));
 }
 
-function headerString(req: FastifyRequest, name: string): string | undefined {
+function headerString(req: Request, name: string): string | undefined {
   const value = req.headers[name];
   if (Array.isArray(value)) return value[0];
   return value;

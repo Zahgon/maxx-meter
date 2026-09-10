@@ -1,4 +1,4 @@
-import type { FastifyRequest } from "fastify";
+import type { Request } from "express";
 
 const INGRESS_PATH_HEADER = "x-ingress-path";
 
@@ -8,7 +8,7 @@ const INGRESS_PATH_HEADER = "x-ingress-path";
 // Assistant itself and 404s.
 const SAFE_PATH = /^\/[A-Za-z0-9._~\-/]*$/;
 
-export function ingressBasePath(req: FastifyRequest): string {
+export function ingressBasePath(req: Request): string {
   const raw = req.headers[INGRESS_PATH_HEADER];
   const value = (Array.isArray(raw) ? raw[0] : raw)?.trim();
   if (!value) return "";

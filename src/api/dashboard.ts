@@ -1,9 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import Fastify from "fastify";
-import type { FastifyReply, FastifyRequest } from "fastify";
-import fastifyStatic from "@fastify/static";
+import express from "express";
+import type { Request, Response } from "express";
 import { ingressBasePath, withIngressBase } from "./ingress.js";
 import {
   createAccount,
@@ -37,6 +36,7 @@ import {
   resolveTargetUserId,
   resolveUserFromRequest,
 } from "../users/context.js";
+import { createApp } from "./http.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
@@ -58,40 +58,50 @@ function isTrustedRemote(remote: string): boolean {
   );
 }
 
-export async function createDashboardServer(poller: UsagePoller, mqtt?: MqttPublisher) {
-  const app = Fastify({ logger: false });
+function queryString(value: unknown): string | undefined {
+  if (Array.isArray(value)) return typeof value[0] === "string" ? value[0] : undefined;
+  return typeof value === "string" ? value : undefined;
+}
 
-  app.addHook("onRequest", async (req, reply) => {
+export async function createDashboardServer(poller: UsagePoller, mqtt?: MqttPublisher) {
+  const app = createApp();
+
+  app.use((req, res, next) => {
     const trusted =
       isTrustedRemote(req.socket.remoteAddress ?? "") ||
       process.env.MAXXMETER_TRUST_ALL_INGRESS === "true";
     if (!trusted && process.env.NODE_ENV === "production") {
-      return reply.code(403).send({ error: "ingress only" });
+      res.status(403).json({ error: "ingress only" });
+      return;
     }
+    next();
   });
 
-  app.get("/api/dashboard/me", async (req) => {
+  app.get("/api/dashboard/me", async (req, res) => {
     const user = resolveUserFromRequest(req);
     await claimUnassignedPanels(user.userId);
-    return { userId: user.userId, userName: user.userName, isAdmin: user.isAdmin };
+    res.json({ userId: user.userId, userName: user.userName, isAdmin: user.isAdmin });
   });
 
-  app.get("/api/dashboard/users", async (req, reply) => {
+  app.get("/api/dashboard/users", async (req, res) => {
     const user = resolveUserFromRequest(req);
-    if (!user.isAdmin) return reply.code(403).send({ error: "admin only" });
+    if (!user.isAdmin) {
+      res.status(403).json({ error: "admin only" });
+      return;
+    }
     const [accounts, panels] = await Promise.all([listAccounts(), listPanels()]);
-    return mergeDashboardUsers(accounts, panels);
+    res.json(mergeDashboardUsers(accounts, panels));
   });
 
-  app.get<{ Querystring: { userId?: string } }>("/api/dashboard/usage", async (req) => {
+  app.get("/api/dashboard/usage", async (req, res) => {
     const user = resolveUserFromRequest(req);
-    const target = resolveTargetUserId(user, req.query.userId);
-    return poller.getSnapshotsForUser(target);
+    const target = resolveTargetUserId(user, queryString(req.query.userId));
+    res.json(poller.getSnapshotsForUser(target));
   });
 
-  app.get<{ Querystring: { userId?: string } }>("/api/dashboard/accounts", async (req) => {
+  app.get("/api/dashboard/accounts", async (req, res) => {
     const user = resolveUserFromRequest(req);
-    const target = resolveTargetUserId(user, req.query.userId);
+    const target = resolveTargetUserId(user, queryString(req.query.userId));
     const accounts = await listAccountsForUser(target);
     const enriched = await Promise.all(
       accounts.map(async (a) => ({
@@ -99,110 +109,113 @@ export async function createDashboardServer(poller: UsagePoller, mqtt?: MqttPubl
         connected: Boolean(await getCredential(a.id)),
       })),
     );
-    return enriched;
+    res.json(enriched);
   });
 
-  app.post<{ Body: { provider: string; label: string } }>(
-    "/api/dashboard/accounts",
-    async (req, reply) => {
-      const user = resolveUserFromRequest(req);
-      const provider = ProviderIdSchema.safeParse(req.body?.provider);
-      const label = req.body?.label?.trim();
-      if (!provider.success || !label) {
-        return reply.code(400).send({ error: "provider and label required" });
-      }
-      const account = await createAccount({
-        provider: provider.data,
-        label,
-        ownerUserId: user.userId,
-        ownerUserName: user.userName,
-      });
-      return account;
-    },
-  );
-
-  app.delete<{ Params: { id: string } }>(
-    "/api/dashboard/accounts/:id",
-    async (req, reply) => {
-      const user = resolveUserFromRequest(req);
-      const account = await getAccount(req.params.id);
-      if (!account) return reply.code(404).send({ error: "not found" });
-      if (account.ownerUserId !== user.userId && !user.isAdmin) {
-        return reply.code(403).send({ error: "forbidden" });
-      }
-      await deleteCredential(account.id);
-      await deleteAccount(account.id);
-      return { ok: true };
-    },
-  );
-
-  app.post<{ Params: { id: string }; Body: { token: string; authMethod?: string } }>(
-    "/api/dashboard/accounts/:id/connect",
-    async (req, reply) => {
-      const user = resolveUserFromRequest(req);
-      const account = await getAccount(req.params.id);
-      if (!account) return reply.code(404).send({ error: "not found" });
-      if (account.ownerUserId !== user.userId && !user.isAdmin) {
-        return reply.code(403).send({ error: "forbidden" });
-      }
-      const token = req.body?.token?.trim();
-      if (!token) return reply.code(400).send({ error: "token required" });
-
-      const authMethod =
-        req.body.authMethod === "oauth"
-          ? "oauth"
-          : account.provider === "kimi"
-            ? "api_key"
-            : account.provider === "cursor"
-              ? "session"
-              : "session";
-
-      await saveCredential({
-        accountId: account.id,
-        ownerUserId: account.ownerUserId,
-        provider: account.provider,
-        authMethod,
-        accessToken: token,
-        connectedAt: new Date().toISOString(),
-      });
-      await poller.pollOnce();
-      return { ok: true };
-    },
-  );
-
-  app.post<{ Params: { id: string } }>(
-    "/api/dashboard/accounts/:id/disconnect",
-    async (req, reply) => {
-      const user = resolveUserFromRequest(req);
-      const account = await getAccount(req.params.id);
-      if (!account) return reply.code(404).send({ error: "not found" });
-      if (account.ownerUserId !== user.userId && !user.isAdmin) {
-        return reply.code(403).send({ error: "forbidden" });
-      }
-      await deleteCredential(account.id);
-      await poller.pollOnce();
-      return { ok: true };
-    },
-  );
-
-  app.get<{ Querystring: { userId?: string } }>("/api/dashboard/panels", async (req) => {
+  app.post("/api/dashboard/accounts", async (req, res) => {
     const user = resolveUserFromRequest(req);
-    const target = resolveTargetUserId(user, req.query.userId);
-    return listPanelsForUser(target);
+    const provider = ProviderIdSchema.safeParse(req.body?.provider);
+    const label = req.body?.label?.trim();
+    if (!provider.success || !label) {
+      res.status(400).json({ error: "provider and label required" });
+      return;
+    }
+    const account = await createAccount({
+      provider: provider.data,
+      label,
+      ownerUserId: user.userId,
+      ownerUserName: user.userName,
+    });
+    res.json(account);
   });
 
-  app.post<{
-    Body: { label: string; deviceProfile: string; accountIds?: string[] };
-  }>("/api/dashboard/panels", async (req, reply) => {
+  app.delete("/api/dashboard/accounts/:id", async (req, res) => {
+    const user = resolveUserFromRequest(req);
+    const account = await getAccount(req.params.id);
+    if (!account) {
+      res.status(404).json({ error: "not found" });
+      return;
+    }
+    if (account.ownerUserId !== user.userId && !user.isAdmin) {
+      res.status(403).json({ error: "forbidden" });
+      return;
+    }
+    await deleteCredential(account.id);
+    await deleteAccount(account.id);
+    res.json({ ok: true });
+  });
+
+  app.post("/api/dashboard/accounts/:id/connect", async (req, res) => {
+    const user = resolveUserFromRequest(req);
+    const account = await getAccount(req.params.id);
+    if (!account) {
+      res.status(404).json({ error: "not found" });
+      return;
+    }
+    if (account.ownerUserId !== user.userId && !user.isAdmin) {
+      res.status(403).json({ error: "forbidden" });
+      return;
+    }
+    const token = req.body?.token?.trim();
+    if (!token) {
+      res.status(400).json({ error: "token required" });
+      return;
+    }
+
+    const authMethod =
+      req.body.authMethod === "oauth"
+        ? "oauth"
+        : account.provider === "kimi"
+          ? "api_key"
+          : account.provider === "cursor"
+            ? "session"
+            : "session";
+
+    await saveCredential({
+      accountId: account.id,
+      ownerUserId: account.ownerUserId,
+      provider: account.provider,
+      authMethod,
+      accessToken: token,
+      connectedAt: new Date().toISOString(),
+    });
+    await poller.pollOnce();
+    res.json({ ok: true });
+  });
+
+  app.post("/api/dashboard/accounts/:id/disconnect", async (req, res) => {
+    const user = resolveUserFromRequest(req);
+    const account = await getAccount(req.params.id);
+    if (!account) {
+      res.status(404).json({ error: "not found" });
+      return;
+    }
+    if (account.ownerUserId !== user.userId && !user.isAdmin) {
+      res.status(403).json({ error: "forbidden" });
+      return;
+    }
+    await deleteCredential(account.id);
+    await poller.pollOnce();
+    res.json({ ok: true });
+  });
+
+  app.get("/api/dashboard/panels", async (req, res) => {
+    const user = resolveUserFromRequest(req);
+    const target = resolveTargetUserId(user, queryString(req.query.userId));
+    res.json(await listPanelsForUser(target));
+  });
+
+  app.post("/api/dashboard/panels", async (req, res) => {
     const user = resolveUserFromRequest(req);
     const label = req.body?.label?.trim();
     const deviceProfile = req.body?.deviceProfile;
     if (!label || (deviceProfile !== "nspanel-eu" && deviceProfile !== "nspanel-us-portrait")) {
-      return reply.code(400).send({ error: "label and deviceProfile required" });
+      res.status(400).json({ error: "label and deviceProfile required" });
+      return;
     }
     const owned = await listAccountsForUser(user.userId);
     const ownedIds = new Set(owned.map((a) => a.id));
-    const accountIds = (req.body.accountIds ?? owned.map((a) => a.id)).filter((id) =>
+    const accountIds = (req.body.accountIds ?? owned.map((a) => a.id)).filter((id: string) =>
       ownedIds.has(id),
     );
     const panel = await createPanel({
@@ -211,22 +224,23 @@ export async function createDashboardServer(poller: UsagePoller, mqtt?: MqttPubl
       ownerUserId: user.userId,
       accountIds,
     });
-    return panel;
+    res.json(panel);
   });
 
-  app.put<{
-    Params: { id: string };
-    Body: { label?: string; accountIds?: string[]; deviceProfile?: string };
-  }>("/api/dashboard/panels/:id", async (req, reply) => {
+  app.put("/api/dashboard/panels/:id", async (req, res) => {
     const user = resolveUserFromRequest(req);
     const panel = await getPanel(req.params.id);
-    if (!panel) return reply.code(404).send({ error: "not found" });
+    if (!panel) {
+      res.status(404).json({ error: "not found" });
+      return;
+    }
     if (panel.ownerUserId !== user.userId && !user.isAdmin) {
-      return reply.code(403).send({ error: "forbidden" });
+      res.status(403).json({ error: "forbidden" });
+      return;
     }
     const owned = await listAccountsForUser(panel.ownerUserId);
     const ownedIds = new Set(owned.map((a) => a.id));
-    const accountIds = req.body.accountIds?.filter((id) => ownedIds.has(id));
+    const accountIds = req.body.accountIds?.filter((id: string) => ownedIds.has(id));
     const updated = await updatePanel(panel.id, {
       label: req.body.label?.trim() || panel.label,
       accountIds: accountIds ?? panel.accountIds,
@@ -235,52 +249,60 @@ export async function createDashboardServer(poller: UsagePoller, mqtt?: MqttPubl
           ? req.body.deviceProfile
           : panel.deviceProfile,
     });
-    return updated;
+    res.json(updated);
   });
 
-  app.post<{ Params: { id: string } }>(
-    "/api/dashboard/panels/:id/regenerate-key",
-    async (req, reply) => {
-      const user = resolveUserFromRequest(req);
-      const panel = await getPanel(req.params.id);
-      if (!panel) return reply.code(404).send({ error: "not found" });
-      if (panel.ownerUserId !== user.userId && !user.isAdmin) {
-        return reply.code(403).send({ error: "forbidden" });
-      }
-      return regeneratePanelApiKey(panel.id);
-    },
-  );
-
-  app.delete<{ Params: { id: string } }>(
-    "/api/dashboard/panels/:id",
-    async (req, reply) => {
-      const user = resolveUserFromRequest(req);
-      const panel = await getPanel(req.params.id);
-      if (!panel) return reply.code(404).send({ error: "not found" });
-      if (panel.ownerUserId !== user.userId && !user.isAdmin) {
-        return reply.code(403).send({ error: "forbidden" });
-      }
-      await deletePanel(panel.id);
-      return { ok: true };
-    },
-  );
-
-  app.get("/api/dashboard/settings", async (req, reply) => {
+  app.post("/api/dashboard/panels/:id/regenerate-key", async (req, res) => {
     const user = resolveUserFromRequest(req);
-    if (!user.isAdmin) return reply.code(403).send({ error: "admin only" });
+    const panel = await getPanel(req.params.id);
+    if (!panel) {
+      res.status(404).json({ error: "not found" });
+      return;
+    }
+    if (panel.ownerUserId !== user.userId && !user.isAdmin) {
+      res.status(403).json({ error: "forbidden" });
+      return;
+    }
+    res.json(await regeneratePanelApiKey(panel.id));
+  });
+
+  app.delete("/api/dashboard/panels/:id", async (req, res) => {
+    const user = resolveUserFromRequest(req);
+    const panel = await getPanel(req.params.id);
+    if (!panel) {
+      res.status(404).json({ error: "not found" });
+      return;
+    }
+    if (panel.ownerUserId !== user.userId && !user.isAdmin) {
+      res.status(403).json({ error: "forbidden" });
+      return;
+    }
+    await deletePanel(panel.id);
+    res.json({ ok: true });
+  });
+
+  app.get("/api/dashboard/settings", async (req, res) => {
+    const user = resolveUserFromRequest(req);
+    if (!user.isAdmin) {
+      res.status(403).json({ error: "admin only" });
+      return;
+    }
     const settings = await loadSettings();
-    return {
+    res.json({
       ...settings,
       ha: { ...settings.ha, token: settings.ha.token ? "***" : "" },
       mqtt: { ...settings.mqtt, password: settings.mqtt.password ? "***" : "" },
-    };
+    });
   });
 
-  app.put<{ Body: Record<string, unknown> }>("/api/dashboard/settings", async (req, reply) => {
+  app.put("/api/dashboard/settings", async (req, res) => {
     const user = resolveUserFromRequest(req);
-    if (!user.isAdmin) return reply.code(403).send({ error: "admin only" });
+    if (!user.isAdmin) {
+      res.status(403).json({ error: "admin only" });
+      return;
+    }
     const current = await loadSettings();
-    const body = req.body ?? {};
+    const body = (req.body ?? {}) as Record<string, unknown>;
     const mqttBody = body.mqtt as { password?: string } | undefined;
     const haBody = body.ha as { token?: string } | undefined;
     const next = GlobalSettingsSchema.parse({
@@ -308,114 +330,118 @@ export async function createDashboardServer(poller: UsagePoller, mqtt?: MqttPubl
       const latest = await loadSettings();
       mqtt.reconnect(latest);
     }
-    return { ok: true };
+    res.json({ ok: true });
   });
 
-  app.get<{ Querystring: { accountId?: string } }>(
-    "/api/auth/claude/start",
-    async (req, reply) => {
-      const user = resolveUserFromRequest(req);
-      const accountId = req.query.accountId;
-      if (!accountId) return reply.code(400).send({ error: "accountId required" });
+  app.get("/api/auth/claude/start", async (req, res) => {
+    const user = resolveUserFromRequest(req);
+    const accountId = queryString(req.query.accountId);
+    if (!accountId) {
+      res.status(400).json({ error: "accountId required" });
+      return;
+    }
 
-      const account = await getAccount(accountId);
-      if (!account) return reply.code(404).send({ error: "account not found" });
+    const account = await getAccount(accountId);
+    if (!account) {
+      res.status(404).json({ error: "account not found" });
+      return;
+    }
+    if (account.ownerUserId !== user.userId && !user.isAdmin) {
+      res.status(403).json({ error: "forbidden" });
+      return;
+    }
+    if (account.provider !== "claude") {
+      res.status(400).json({ error: "not a claude account" });
+      return;
+    }
+
+    const result = await startClaudeOAuth({
+      accountId: account.id,
+      ownerUserId: account.ownerUserId,
+    });
+    res.json(result);
+  });
+
+  app.post("/api/auth/claude/exchange", async (req, res) => {
+    const user = resolveUserFromRequest(req);
+    const stateId = req.body?.stateId?.trim();
+    const code = req.body?.code?.trim();
+    if (!stateId || !code) {
+      res.status(400).json({ error: "stateId and code required" });
+      return;
+    }
+
+    try {
+      const result = await exchangeClaudeOAuthCode({ stateId, code });
+      const account = await getAccount(result.accountId);
+      if (!account) {
+        res.status(404).json({ error: "account not found" });
+        return;
+      }
       if (account.ownerUserId !== user.userId && !user.isAdmin) {
-        return reply.code(403).send({ error: "forbidden" });
-      }
-      if (account.provider !== "claude") {
-        return reply.code(400).send({ error: "not a claude account" });
+        res.status(403).json({ error: "forbidden" });
+        return;
       }
 
-      const result = await startClaudeOAuth({
-        accountId: account.id,
-        ownerUserId: account.ownerUserId,
+      await saveCredential({
+        accountId: result.accountId,
+        ownerUserId: result.ownerUserId,
+        provider: "claude",
+        authMethod: "oauth",
+        accessToken: result.access_token,
+        refreshToken: result.refresh_token,
+        expiresAt: claudeExpiresAt(result.expires_in),
+        connectedAt: new Date().toISOString(),
       });
-      return result;
-    },
-  );
-
-  app.post<{ Body: { stateId?: string; code?: string } }>(
-    "/api/auth/claude/exchange",
-    async (req, reply) => {
-      const user = resolveUserFromRequest(req);
-      const stateId = req.body?.stateId?.trim();
-      const code = req.body?.code?.trim();
-      if (!stateId || !code) {
-        return reply.code(400).send({ error: "stateId and code required" });
-      }
-
-      try {
-        const result = await exchangeClaudeOAuthCode({ stateId, code });
-        const account = await getAccount(result.accountId);
-        if (!account) return reply.code(404).send({ error: "account not found" });
-        if (account.ownerUserId !== user.userId && !user.isAdmin) {
-          return reply.code(403).send({ error: "forbidden" });
-        }
-
-        await saveCredential({
-          accountId: result.accountId,
-          ownerUserId: result.ownerUserId,
-          provider: "claude",
-          authMethod: "oauth",
-          accessToken: result.access_token,
-          refreshToken: result.refresh_token,
-          expiresAt: claudeExpiresAt(result.expires_in),
-          connectedAt: new Date().toISOString(),
-        });
-        await poller.pollOnce();
-        return { ok: true, accountId: result.accountId };
-      } catch (err) {
-        return reply.code(400).send({
-          error: err instanceof Error ? err.message : "OAuth exchange failed",
-        });
-      }
-    },
-  );
+      await poller.pollOnce();
+      res.json({ ok: true, accountId: result.accountId });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : "OAuth exchange failed",
+      });
+    }
+  });
 
   // Cursor/Kimi: token paste fallback (OAuth requires provider-registered redirect URIs)
-  app.get<{ Params: { provider: string } }>(
-    "/api/auth/:provider/start",
-    async (req, reply) => {
-      const provider = req.params.provider;
-      if (provider === "claude") {
-        return reply.code(400).send({ error: "Use /api/auth/claude/start?accountId=" });
-      }
-      return reply.redirect(
-        `${ingressBasePath(req)}/accounts?oauth=manual&provider=${encodeURIComponent(provider)}`,
-      );
-    },
-  );
+  app.get("/api/auth/:provider/start", async (req, res) => {
+    const provider = req.params.provider;
+    if (provider === "claude") {
+      res.status(400).json({ error: "Use /api/auth/claude/start?accountId=" });
+      return;
+    }
+    res.redirect(
+      `${ingressBasePath(req)}/accounts?oauth=manual&provider=${encodeURIComponent(provider)}`,
+    );
+  });
 
   const dashboardDist = join(__dirname, "../../dashboard/dist");
   const indexHtml = await readIndexHtml(dashboardDist);
 
-  const sendIndex = (req: FastifyRequest, reply: FastifyReply) =>
-    reply
+  const sendIndex = (req: Request, res: Response) =>
+    res
       .type("text/html; charset=utf-8")
       .send(withIngressBase(indexHtml, ingressBasePath(req)));
 
-  // Intercept before @fastify/static so the shell always carries a <base href> pointing at
+  // Intercept before express.static so the shell always carries a <base href> pointing at
   // the ingress prefix; without it the browser asks Home Assistant for ./assets and /api.
-  app.addHook("onRequest", async (req, reply) => {
-    if (req.method !== "GET" && req.method !== "HEAD") return;
+  app.use((req, res, next) => {
+    if (req.method !== "GET" && req.method !== "HEAD") return next();
     const path = req.url.split("?")[0];
     if (path === "/" || path === "/index.html") {
-      return sendIndex(req, reply);
+      sendIndex(req, res);
+      return;
     }
+    next();
   });
 
-  await app.register(fastifyStatic, {
-    root: dashboardDist,
-    prefix: "/",
-    index: false,
-  });
+  app.use(express.static(dashboardDist, { index: false }));
 
-  app.setNotFoundHandler((req, reply) => {
+  app.use((req, res) => {
     if (req.url.startsWith("/api/")) {
-      return reply.code(404).send({ error: "not found" });
+      res.status(404).json({ error: "not found" });
+      return;
     }
-    return sendIndex(req, reply);
+    sendIndex(req, res);
   });
 
   return app;
